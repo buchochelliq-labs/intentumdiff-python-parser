@@ -1,0 +1,14 @@
+# Bundled parser metadata for the IntentDiff language-info API.
+# Plugin code exposes this data; the host still owns trust and provenance.
+
+[plugin]
+author = IntentDiff
+plugin_version = 0.1.0
+last_updated = 2026-05-19
+
+[language.python]
+language_name = Python
+language_short_name = Python
+monaco_language = python
+default_filename = code.py
+language_file_extensions = .py, .pyi
