@@ -1,5 +1,9 @@
 # intentdiff-python-parser
 
+[![CI](https://github.com/buchochelliq-labs/intentdiff-python-parser/actions/workflows/ci.yml/badge.svg)](https://github.com/buchochelliq-labs/intentdiff-python-parser/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Rust 1.93](https://img.shields.io/badge/rust-1.93-orange.svg)](https://www.rust-lang.org/)
+
 The **Python parser plugin** for IntentDiff — a Wasm component (WASI p2, Component Model)
 implementing the `intentdiff:plugin` parser interface in full-parse mode: it receives raw
 Python source and emits a deterministic `SemanticNode` tree (tree-sitter based).
