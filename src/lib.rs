@@ -8,7 +8,7 @@
 //!
 //! Trivia stripped by the host: comment, whitespace (see trivia_node_types).
 
-use intentdiff_plugin_sdk::{
+use intentumdiff_plugin_sdk::{
     cst::CstNode,
     hash::structural_hash_with_memo,
     tree::{NodeFacts, SemanticNode, SemanticNodeBuilder},
@@ -27,7 +27,7 @@ use crate::exports::intentdiff::plugin::parser::ParserMode;
 const PLUGIN_METADATA: &str = include_str!("../plugin_metadata.info");
 
 fn language_info_for(ids: Vec<String>) -> Vec<LanguageInfoRecord> {
-    let metadata = intentdiff_plugin_sdk::metadata::parse_plugin_metadata(PLUGIN_METADATA);
+    let metadata = intentumdiff_plugin_sdk::metadata::parse_plugin_metadata(PLUGIN_METADATA);
     ids.into_iter()
         .map(|language_id| {
             let info = metadata.language_or_default(&language_id);
@@ -381,7 +381,7 @@ export!(PythonParser);
 mod tests {
     use super::*;
     use crate::exports::intentdiff::plugin::parser::Guest;
-    use intentdiff_plugin_sdk::testing as t;
+    use intentumdiff_plugin_sdk::testing as t;
 
     #[test]
     fn grammar_id_nonempty() {
