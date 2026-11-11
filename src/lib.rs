@@ -97,6 +97,8 @@ const SEMANTIC_TYPES: &[&str] = &[
     "argument_list",
     "type",
     "type_annotation",
+    // Anonymous operator / keyword tokens (see OPERATOR_NODE_TYPE).
+    OPERATOR_NODE_TYPE,
 ];
 
 fn is_semantic(node_type: &str) -> bool {
@@ -262,20 +264,89 @@ fn convert(
     Some(builder.build())
 }
 
+// ---------------------------------------------------------------------------
+// Anonymous-token contract (core #229/#230): operators and behaviour-selecting keywords
+// ---------------------------------------------------------------------------
+
+/// Node type of the leaf that carries one anonymous operator/keyword token; its text (and
+/// so its label) is the token itself. This is the vocabulary core's native Python serializer
+/// emits and core's Wasm recovery pass treats as already present.
+const OPERATOR_NODE_TYPE: &str = "operator";
+
+/// Node kinds whose anonymous tokens are behaviour-changing operators (mirrors core's
+/// `is_operator_bearing`, restricted to what tree-sitter-python produces).
+fn is_operator_bearing(kind: &str) -> bool {
+    const PARTS: &[&str] = &[
+        "binary",
+        "unary",
+        "operator",
+        "assignment",
+        "comparison",
+        "boolean",
+    ];
+    PARTS.iter().any(|part| kind.contains(part))
+        && !kind.contains("declarat")
+        && !kind.contains("definition")
+}
+
+const WORD_OPERATORS: &[&str] = &["and", "or", "not", "is", "in"];
+const SYMBOL_CHARS: &[char] = &[
+    '+', '-', '*', '/', '%', '<', '>', '=', '!', '&', '|', '^', '~', '?', '@',
+];
+
+/// Is this whole anonymous token an operator? `is not` / `not in` arrive as one token.
+fn is_operator_token(token: &str) -> bool {
+    !token.is_empty()
+        && (token.chars().all(|c| SYMBOL_CHARS.contains(&c))
+            || token
+                .split_whitespace()
+                .all(|word| WORD_OPERATORS.contains(&word)))
+}
+
+/// `async for`, `async with` and `[x async for x in xs]` select a different iteration /
+/// context protocol; tree-sitter keeps `async` as an anonymous first child of these.
+fn carries_async_keyword(kind: &str) -> bool {
+    matches!(kind, "for_statement" | "with_statement" | "for_in_clause")
+}
+
+fn token_leaf(token: tree_sitter::Node<'_>) -> CstNode {
+    CstNode {
+        node_type: OPERATOR_NODE_TYPE.to_string(),
+        named: false,
+        // The token KIND, not its source slice: `is  not` and `is not` are the same operator,
+        // so layout never reaches the label or the hash.
+        text: Some(token.kind().to_string()),
+        start_line: token.start_position().row as u32,
+        start_col: token.start_position().column as u32,
+        end_line: token.end_position().row as u32,
+        end_col: token.end_position().column as u32,
+        children: Vec::new(),
+    }
+}
+
 fn node_to_cst(node: tree_sitter::Node<'_>, source: &[u8]) -> CstNode {
-    let children: Vec<CstNode> = (0..node.named_child_count())
-        .filter_map(|i| node.named_child(i))
-        .map(|child| node_to_cst(child, source))
+    let operator_bearing = is_operator_bearing(node.kind());
+    let async_keyword = carries_async_keyword(node.kind());
+    let mut cursor = node.walk();
+    let children: Vec<CstNode> = node
+        .children(&mut cursor)
+        .enumerate()
+        .filter_map(|(i, child)| {
+            if child.is_named() {
+                Some(node_to_cst(child, source))
+            } else if (operator_bearing && is_operator_token(child.kind()))
+                || (async_keyword && i == 0 && child.kind() == "async")
+            {
+                Some(token_leaf(child))
+            } else {
+                None
+            }
+        })
         .collect();
 
     let text = if children.is_empty() {
-        Some(
-            node.utf8_text(source)
-                .unwrap_or("")
-                .chars()
-                .take(4096)
-                .collect(),
-        )
+        // Semantic hashes must include the complete leaf, including long literal tails.
+        Some(node.utf8_text(source).unwrap_or("").to_owned())
     } else {
         None
     };
@@ -510,5 +581,145 @@ mod tests {
         let json = serde_json::to_string(&sem).expect("json");
         assert!(json.contains("\"facts\""));
         assert!(json.contains("\"body\":\"stub\""));
+    }
+
+    // ---- Complete-payload contract (issue #4): no local 4096-character leaf cap ----
+
+    fn root_hash(source: &str) -> String {
+        let tree: serde_json::Value = serde_json::from_str(&process_impl(source)).unwrap();
+        assert!(tree.get("error").is_none(), "{tree}");
+        tree["structural_hash"].as_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn long_string_suffix_changes_root_hash() {
+        // The issue's exact control: x = "a"*n + X vs Y, n = 120 / 4096 / 8192, plus the
+        // boundary neighbours and a multibyte prefix that crosses the old character cap.
+        for n in [120, 4095, 4096, 4097, 8192, 32768] {
+            for prefix in ["a".repeat(n), "é🦀".repeat(n)] {
+                let old = format!("x = \"{prefix}X\"\n");
+                let new = format!("x = \"{prefix}Y\"\n");
+                assert_ne!(root_hash(&old), root_hash(&new), "prefix length {n}");
+                assert_eq!(process_impl(&old), process_impl(&old), "deterministic");
+            }
+        }
+    }
+
+    #[test]
+    fn long_string_leaf_keeps_complete_utf8_text_and_byte_span() {
+        for payload in [format!("{}X", "a".repeat(8192)), format!("{}X", "é界🦀".repeat(4200))] {
+            let source = format!("x = \"{payload}\"\n");
+            let root = parse_source(&source).unwrap();
+            let leaf = root
+                .walk()
+                .find(|n| n.node_type == "string_content")
+                .expect("string_content leaf");
+            assert_eq!(leaf.text.as_deref(), Some(payload.as_str()));
+            assert_eq!((leaf.start_line, leaf.start_col), (0, 5));
+            assert_eq!((leaf.end_line, leaf.end_col), (0, 5 + payload.len() as u32));
+            assert!(source.is_char_boundary(leaf.start_col as usize));
+            assert!(source.is_char_boundary(leaf.end_col as usize));
+            assert_eq!(&source[leaf.start_col as usize..leaf.end_col as usize], payload);
+        }
+    }
+
+    #[test]
+    fn long_integer_and_identifier_suffixes_change_root_hash() {
+        let digits = "7".repeat(5000);
+        assert_ne!(root_hash(&format!("x = {digits}1\n")), root_hash(&format!("x = {digits}2\n")));
+        let name = "n".repeat(5000);
+        assert_ne!(root_hash(&format!("{name}a = 1\n")), root_hash(&format!("{name}b = 1\n")));
+    }
+
+    #[test]
+    fn unchanged_long_string_keeps_hash_across_spacing() {
+        let payload = "é🦀".repeat(4200);
+        assert_eq!(
+            root_hash(&format!("x = \"{payload}\"\n")),
+            root_hash(&format!("x   =   \"{payload}\"\n"))
+        );
+    }
+
+    // ---- Anonymous-token contract (issue #4 / core #230): operators are emitted ----
+
+    fn operator_leaves(source: &str) -> Vec<(String, (u32, u32, u32, u32))> {
+        fn collect(node: &SemanticNode, out: &mut Vec<(String, (u32, u32, u32, u32))>) {
+            if node.node_type == OPERATOR_NODE_TYPE {
+                let p = &node.position;
+                out.push((node.label.clone(), (p.start_line, p.start_col, p.end_line, p.end_col)));
+            }
+            node.children.iter().for_each(|c| collect(c, out));
+        }
+        let tree: SemanticNode = serde_json::from_str(&process_impl(source)).unwrap();
+        let mut out = Vec::new();
+        collect(&tree, &mut out);
+        out
+    }
+
+    #[test]
+    fn binary_operator_is_emitted_with_its_source_span() {
+        let old = "def f(a,b):\n    return a + b\n";
+        let new = "def f(a,b):\n    return a - b\n";
+        assert_eq!(operator_leaves(old), vec![("+".to_string(), (1, 13, 1, 14))]);
+        assert_eq!(operator_leaves(new), vec![("-".to_string(), (1, 13, 1, 14))]);
+        assert_ne!(root_hash(old), root_hash(new));
+        // The function's identity label is untouched by the operator leaf.
+        let tree: serde_json::Value = serde_json::from_str(&process_impl(old)).unwrap();
+        assert_eq!(tree["children"][0]["label"], "f");
+    }
+
+    #[test]
+    fn every_python_operator_family_changes_the_hash() {
+        for (old, new) in [
+            ("x = a < b\n", "x = a > b\n"),
+            ("x = a is b\n", "x = a is not b\n"),
+            ("x = a in b\n", "x = a not in b\n"),
+            ("x = a and b\n", "x = a or b\n"),
+            ("x = -y\n", "x = ~y\n"),
+            ("x = not y\n", "x = y\n"),
+            ("x += 1\n", "x -= 1\n"),
+            ("x = a * b\n", "x = a @ b\n"),
+            ("x = a // b\n", "x = a / b\n"),
+            ("x = a ** b\n", "x = a * b\n"),
+        ] {
+            assert_ne!(root_hash(old), root_hash(new), "{old:?} vs {new:?}");
+        }
+    }
+
+    #[test]
+    fn operator_tokens_ignore_layout() {
+        assert_eq!(root_hash("x = a is not b\n"), root_hash("x = a is   not b\n"));
+        // (Comments are trivia stripped host-side via trivia_node_types, not here.)
+        assert_eq!(root_hash("x = a+b\n"), root_hash("x = a  +  b\n"));
+        assert_eq!(operator_leaves("x = a is   not b\n")[1].0, "is not");
+    }
+
+    #[test]
+    fn punctuation_and_parameter_counts_are_not_operator_leaves() {
+        // `(`, `,`, `:` and keyword-argument `=` are not operators; param_count unchanged.
+        assert!(operator_leaves("f(a, b=1)\n").is_empty());
+        let facts = facts_of("def g(a, b=1, *c, **d):\n    pass\n", "function_definition");
+        assert_eq!(facts.param_count, Some(4));
+    }
+
+    #[test]
+    fn async_for_and_with_keep_the_async_keyword() {
+        for (sync, asynchronous) in [
+            (
+                "async def f(xs):\n    for x in xs:\n        pass\n",
+                "async def f(xs):\n    async for x in xs:\n        pass\n",
+            ),
+            (
+                "async def f(c):\n    with c:\n        pass\n",
+                "async def f(c):\n    async with c:\n        pass\n",
+            ),
+            (
+                "async def f(xs):\n    return [x for x in xs]\n",
+                "async def f(xs):\n    return [x async for x in xs]\n",
+            ),
+        ] {
+            assert_ne!(root_hash(sync), root_hash(asynchronous), "{asynchronous:?}");
+            assert!(operator_leaves(asynchronous).iter().any(|(t, _)| t == "async"));
+        }
     }
 }
